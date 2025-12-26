@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Toronto Collision Danger Map</title>
+
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+
+  <style>
+    #map {
+      height: 600px;
+      width: 100%;
+    }
+    .controls {
+      margin: 10px;
+      font-family: Arial, sans-serif;
+    }
+    .hint {
+      font-size: 12px;
+      color: #555;
+      margin-top: 4px;
+    }
+    select {
+      vertical-align: top;
+    }
+    button {
+      margin-left: 5px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="controls">
+  <label>
+    Number of intersections:
+    <input type="number" id="limitInput" value="30" min="1" max="500">
+  </label>
+
+  <br><br>
+
+  <label>
+    Ward(s):
+    <select id="wardSelect" multiple size="8"></select>
+  </label>
+
+  <div class="hint">
+    <strong>How to select multiple wards:</strong><br>
+    • Windows / Linux: Hold <b>Ctrl</b> (or <b>Shift</b>) and click<br>
+    • Mac: Hold <b>⌘ Command</b> (or <b>Shift</b>) and click
+  </div>
+
+  <br>
+
+  <button onclick="selectAllWards()">Select All</button>
+  <button onclick="clearWards()">Clear</button>
+  <button onclick="updateMap()">Load</button>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+
+<script>
+  // -----------------------------
+  // Initialize map
+  // -----------------------------
+  const map = L.map('map').setView([43.6532, -79.3832], 12);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  const markerLayer = L.layerGroup().addTo(map);
+
+  let allData = [];
+
+  // -----------------------------
+  // Load CSV
+  // -----------------------------
+  d3.csv("collisions_with_wards.csv", d => ({
+    lat: +d.LAT,
+    lon: +d.LON,
+    danger: +d.DANGER_SCORE,
+    collisions: +d.TOTAL_COLLISIONS,
+    injuries: +d.INJURY_COLLISIONS,
+    fatalities: +d.FATALITIES,
+    ward: d.WARD_NUM && d.WARD_NUM.trim() !== "" ? d.WARD_NUM.trim() : null
+  })).then(data => {
+    allData = data;
+    populateWardDropdown(data);
+    updateMap();
+  });
+
+  // -----------------------------
+  // Populate ward dropdown
+  // -----------------------------
+  function populateWardDropdown(data) {
+    const wards = [...new Set(data.map(d => d.ward))]
+      .filter(w => w !== null)
+      .sort((a, b) => +a - +b);
+
+    const select = document.getElementById("wardSelect");
+    select.innerHTML = "";
+
+    wards.forEach(w => {
+      const option = document.createElement("option");
+      option.value = w;
+      option.textContent = `Ward ${w}`;
+      select.appendChild(option);
+    });
+  }
+
+  // -----------------------------
+  // Update map markers
+  // -----------------------------
+  function updateMap() {
+    markerLayer.clearLayers();
+
+    const limit = +document.getElementById("limitInput").value;
+
+    const selectedWards = Array.from(
+      document.getElementById("wardSelect").selectedOptions
+    ).map(o => o.value);
+
+    let filtered = allData;
+
+    if (selectedWards.length > 0) {
+      filtered = filtered.filter(d => d.ward !== null && selectedWards.includes(d.ward));
+    }
+
+    filtered
+      .sort((a, b) => b.danger - a.danger)
+      .slice(0, limit)
+      .forEach(d => {
+        L.marker([d.lat, d.lon])
+          .bindPopup(`
+            <strong>Ward ${d.ward}</strong><br>
+            Collisions: ${d.collisions}<br>
+            Injuries: ${d.injuries}<br>
+            Fatalities: ${d.fatalities}
+          `)
+          .addTo(markerLayer);
+      });
+  }
+
+  // -----------------------------
+  // Utility buttons
+  // -----------------------------
+  function selectAllWards() {
+    const select = document.getElementById("wardSelect");
+    Array.from(select.options).forEach(opt => opt.selected = true);
+  }
+
+  function clearWards() {
+    const select = document.getElementById("wardSelect");
+    Array.from(select.options).forEach(opt => opt.selected = false);
+  }
+</script>
+
+</body>
+</html>
