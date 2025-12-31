@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Toronto Collision Danger Map - Commute Mode</title>
+
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+  <style>
+    #map {
+      height: 600px;
+      width: 100%;
+    }
+    .controls {
+      margin: 10px;
+      font-family: Arial, sans-serif;
+      max-width: 900px;
+    }
+    .hint {
+      font-size: 12px;
+      color: #555;
+      margin-top: 6px;
+      max-width: 750px;
+    }
+    select, input[type="number"], input[type="text"] {
+      vertical-align: top;
+      margin: 4px 0;
+    }
+    button {
+      margin: 4px 4px 0 0;
+    }
+    .commute-list {
+      margin-top: 8px;
+      font-size: 13px;
+    }
+    .commute-item {
+      margin: 4px 0;
+    }
+    .results {
+      margin-top: 8px;
+      font-size: 13px;
+      max-width: 900px;
+    }
+    .small {
+      font-size: 12px;
+      color: #333;
+    }
+  </style>
+</head>
+<body>
+
+<div class="controls">
+  <label>
+    Number of intersections:
+    <input type="number" id="limitInput" value="30" min="1" max="500">
+  </label>
+
+  <br><br>
+
+  <label>
+    Ward(s):
+    <select id="wardSelect" multiple size="8"></select>
+  </label>
+
+  <div class="hint">
+    <strong>Multi-select:</strong><br>
+    Windows/Linux: Ctrl or Shift + click<br>
+    Mac: ⌘ Command or Shift + click
+  </div>
+
+  <button onclick="selectAllWards()">Select All Wards</button>
+  <button onclick="clearWards()">Clear Wards</button>
+
+  <br><br>
+
+  <label>
+    Sort by Road User Type(s):
+    <select id="modeSelect" multiple size="4">
+      <option value="AUTOMOBILE">Cars</option>
+      <option value="MOTORCYCLE">Motorcycles</option>
+      <option value="BICYCLE">Bicycles</option>
+      <option value="PEDESTRIAN">Pedestrians</option>
+    </select>
+  </label>
+
+  <div class="hint">
+    Sorting affects which intersections are shown — not their colour.
+  </div>
+
+  <br><br>
+
+  <button onclick="updateMap()">Load</button>
+
+  <div class="hint">
+    <strong>Note:</strong><br>
+    Marker colours are assigned once using each intersection’s
+    <strong>danger score value</strong>, independent of filters.<br>
+    Darker red markers indicate intersections in the highest risk groups.<br>
+    <strong>Click on a map marker to see collision details.</strong>
+  </div>
+
+  <hr style="margin:12px 0;">
+
+  <h3>Commute tools</h3>
+
+  <div>
+    <label>Origin address: <input id="originInput" type="text" placeholder="e.g. 1 Yonge St, Toronto"></label>
+    <br>
+    <label>Destination address: <input id="destInput" type="text" placeholder="e.g. 401 Bay St, Toronto"></label>
+    <button onclick="geocodeAndRoute()">Geocode & Route</button>
+    <button onclick="clearCommute()">Clear Route</button>
+    <div class="small">Or: click 'Draw commute' and click map to place points; double-click to finish.</div>
+    <button onclick="startDrawRoute()">Draw commute</button>
+    <button onclick="finishDrawRoute()" id="finishDrawBtn" disabled>Finish draw</button>
+  </div>
+
+  <div style="margin-top:8px;">
+    <label>Buffer (meters): <input type="number" id="bufferInput" value="75" min="10" max="1000"></label>
+    <label style="margin-left:12px;">Top N on commute: <input type="number" id="topNInput" value="10" min="1" max="200"></label>
+    <button onclick="showTopNOnCommute()">Show Top N on Commute</button>
+    <button onclick="showAllOnCommute()">Show All On Commute</button>
+  </div>
+
+  <div class="commute-list" id="commuteList"></div>
+
+  <div class="results" id="commuteResults"></div>
+</div>
+
+<div id="map"></div>
+
+<!-- libs -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+<script>
+  // ---- Base map & existing layers ----
+  const map = L.map('map').setView([43.6532, -79.3832], 12);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  const markerLayer = L.layerGroup().addTo(map);
+  let allData = [];
+
+  // Value-based color cutoffs (tight for extreme intersections)
+  const rankColors = [
+    { p: 0.001, color: "#5e0e0e" },
+    { p: 0.002, color: "#9c0909" },
+    { p: 0.005, color: "#ff0000" },
+    { p: 0.009, color: "#ff6f00" },
+    { p: 0.014, color: "#ed9418" },
+    { p: 0.02,  color: "#e6c210" },
+    { p: 0.05,  color: "#ebe70e" },
+    { p: 0.1,   color: "#bce310" },
+    { p: 0.2,   color: "#91d13d" },
+    { p: 1,     color: "#36cf34" }
+  ];
+
+  // commute layers
+  const commuteLayer = L.layerGroup().addTo(map);
+  const commuteBufferLayer = L.layerGroup().addTo(map);
+  const commuteHighlightLayer = L.layerGroup().addTo(map);
+
+  // route state
+  let currentRouteGeoJSON = null; // LineString (OSRM / drawn)
+  let isDrawing = false;
+  let tempDrawPoints = [];
+  let drawPolyline = null;
+
+  d3.csv("collisions_with_wards.csv", d => ({
+    lat: +d.LAT,
+    lon: +d.LON,
+    ward: d.WARD_NUM && d.WARD_NUM.trim() !== "" ? d.WARD_NUM.trim() : null,
+    collisions: +d.TOTAL_COLLISIONS,
+    injuries: +d.INJURY_COLLISIONS,
+    fatalities: +d.FATALITIES,
+    AUTOMOBILE: +d.AUTOMOBILE,
+    MOTORCYCLE: +d.MOTORCYCLE,
+    BICYCLE: +d.BICYCLE,
+    PEDESTRIAN: +d.PEDESTRIAN,
+    danger: +d.DANGER_SCORE
+  })).then(data => {
+    // --- Compute value-based thresholds globally ---
+    const dangerValues = data.map(d => d.danger).sort((a,b)=>a-b);
+    function percentile(p) {
+      const idx = Math.floor(p * dangerValues.length);
+      return dangerValues[Math.min(idx, dangerValues.length-1)];
+    }
+
+    const valueBreaks = [
+      { v: percentile(0.999), color: "#5e0e0e" },
+      { v: percentile(0.998), color: "#9c0909" },
+      { v: percentile(0.995), color: "#ff0000" },
+      { v: percentile(0.991), color: "#ff6f00" },
+      { v: percentile(0.986), color: "#ed9418" },
+      { v: percentile(0.98),  color: "#e6c210" },
+      { v: percentile(0.95),  color: "#ebe70e" },
+      { v: percentile(0.90),  color: "#bce310" },
+      { v: percentile(0.80),  color: "#91d13d" },
+      { v: -Infinity,         color: "#36cf34" }
+    ];
+
+    data.forEach(d => {
+      d.valueColor = valueBreaks.find(b => d.danger >= b.v).color;
+    });
+
+    allData = data;
+    populateWardDropdown(data);
+    updateMap();
+  });
+
+  function populateWardDropdown(data) {
+    const wards = [...new Set(data.map(d => d.ward))]
+      .filter(w => w !== null)
+      .sort((a, b) => +a - +b);
+
+    const select = document.getElementById("wardSelect");
+    select.innerHTML = "";
+
+    wards.forEach(w => {
+      const opt = document.createElement("option");
+      opt.value = w;
+      opt.textContent = `Ward ${w}`;
+      select.appendChild(opt);
+    });
+  }
+
+  // ---- existing map update ----
+  function updateMap() {
+    markerLayer.clearLayers();
+
+    const limit = +document.getElementById("limitInput").value;
+
+    const selectedWards = Array.from(
+      document.getElementById("wardSelect").selectedOptions
+    ).map(o => o.value);
+
+    const selectedModes = Array.from(
+      document.getElementById("modeSelect").selectedOptions
+    ).map(o => o.value);
+
+    let filtered = allData;
+
+    if (selectedWards.length > 0) {
+      filtered = filtered.filter(d =>
+        d.ward !== null && selectedWards.includes(d.ward)
+      );
+    }
+
+    if (selectedModes.length > 0) {
+      filtered = filtered.filter(d =>
+        selectedModes.some(m => d[m] > 0)
+      );
+    }
+
+    filtered.forEach(d => {
+      d.sortValue = selectedModes.length === 0
+        ? d.danger
+        : selectedModes.reduce((s, m) => s + d[m], 0);
+    });
+
+    filtered.sort((a, b) => b.sortValue - a.sortValue);
+
+    const cutoff = filtered.length >= limit
+      ? filtered[limit-1].sortValue
+      : null;
+
+    const finalData = cutoff !== null
+      ? filtered.filter(d => d.sortValue >= cutoff)
+      : filtered;
+
+    finalData.forEach(d => {
+      const modesToShow = selectedModes.length > 0
+        ? selectedModes
+        : ["AUTOMOBILE","MOTORCYCLE","BICYCLE","PEDESTRIAN"];
+
+      const modeLines = modesToShow
+        .map(m => `${d[m]} involve ${m.toLowerCase()}`)
+        .join("<br>");
+
+      L.circleMarker([d.lat,d.lon], {
+        radius: 7,
+        color: "#000",
+        weight: 1,
+        fillColor: d.valueColor,
+        fillOpacity: 0.85
+      })
+      .bindPopup(`
+        <strong>Ward ${d.ward}</strong><br><br>
+        Total collisions: ${d.collisions}<br><br>
+        <strong>Of those collisions:</strong><br>
+        ${modeLines}<br><br>
+        Injuries reported: ${d.injuries}<br>
+        Fatalities reported: ${d.fatalities}
+      `)
+      .addTo(markerLayer);
+    });
+  }
+
+  function selectAllWards() {
+    Array.from(document.getElementById("wardSelect").options)
+      .forEach(o => o.selected = true);
+  }
+
+  function clearWards() {
+    Array.from(document.getElementById("wardSelect").options)
+      .forEach(o => o.selected = false);
+  }
+
+  // ---- Commute helpers ----
+
+  async function geocodeAddress(addr) {
+    // Use Nominatim public API - respect rate limits; for heavy use host your own
+    const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(addr)}&limit=1&addressdetails=0`;
+    try {
+      const r = await fetch(url, {headers: {'Accept': 'application/json'}});
+      const j = await r.json();
+      if (j.length === 0) return null;
+      return { lat: +j[0].lat, lon: +j[0].lon };
+    } catch (e) {
+      console.error("geocode error", e);
+      return null;
+    }
+  }
+
+  async function geocodeAndRoute() {
+    const origin = document.getElementById("originInput").value.trim();
+    const dest = document.getElementById("destInput").value.trim();
+    if (!origin || !dest) {
+      alert("Please enter both origin and destination addresses.");
+      return;
+    }
+
+    const o = await geocodeAddress(origin);
+    const d = await geocodeAddress(dest);
+
+    if (!o || !d) {
+      alert("Geocoding failed for one or both addresses.");
+      return;
+    }
+
+    // center
+    map.panTo([ (o.lat+d.lat)/2, (o.lon+d.lon)/2 ]);
+
+    // request OSRM demo server for route (driving)
+    const coords = `${o.lon},${o.lat};${d.lon},${d.lat}`;
+    const url = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=false`;
+    try {
+      const r = await fetch(url);
+      const j = await r.json();
+      if (!j.routes || j.routes.length === 0) { alert("Routing failed"); return; }
+      const route = j.routes[0];
+      const line = {
+        type: "Feature",
+        geometry: route.geometry
+      };
+      setCurrentRoute(line);
+      addCommuteToList({name: `Route ${new Date().toLocaleTimeString()}`, geojson: line});
+    } catch (e) {
+      console.error("route error", e);
+      alert("Routing error (see console).");
+    }
+  }
+
+  function setCurrentRoute(lineFeature) {
+    currentRouteGeoJSON = lineFeature;
+    commuteLayer.clearLayers();
+    if (lineFeature && lineFeature.geometry && lineFeature.geometry.coordinates.length) {
+      const coords = lineFeature.geometry.coordinates.map(c => [c[1], c[0]]);
+      L.polyline(coords, {color: "#0066cc", weight: 4}).addTo(commuteLayer);
+      map.fitBounds(L.polyline(coords).getBounds(), {padding:[40,40]});
+      drawBufferForRoute();
+    }
+  }
+
+  function drawBufferForRoute() {
+    commuteBufferLayer.clearLayers();
+    const bufMeters = +document.getElementById("bufferInput").value;
+    if (!currentRouteGeoJSON) return;
+    try {
+      const buffer = turf.buffer(currentRouteGeoJSON, bufMeters, {units: 'meters'});
+      L.geoJSON(buffer, {style: {color:'#0066cc', weight:1, opacity:0.3, fillOpacity:0.08}}).addTo(commuteBufferLayer);
+    } catch (e) {
+      console.error("buffer error", e);
+    }
+  }
+
+  function clearCommute() {
+    currentRouteGeoJSON = null;
+    commuteLayer.clearLayers();
+    commuteBufferLayer.clearLayers();
+    commuteHighlightLayer.clearLayers();
+    document.getElementById("commuteResults").innerHTML = "";
+  }
+
+  // -- draw on map mode --
+  function startDrawRoute() {
+    isDrawing = true;
+    tempDrawPoints = [];
+    if (drawPolyline) { map.removeLayer(drawPolyline); drawPolyline = null; }
+    document.getElementById("finishDrawBtn").disabled = false;
+    map.on('click', onMapClickForDraw);
+    map.doubleClickZoom.disable();
+    alert('Drawing mode: click to add points, when finished click "Finish draw" (or double-click map).');
+  }
+
+  function onMapClickForDraw(e) {
+    tempDrawPoints.push([e.latlng.lat, e.latlng.lng]);
+    if (drawPolyline) map.removeLayer(drawPolyline);
+    drawPolyline = L.polyline(tempDrawPoints, {color:'#ff6600', dashArray:'6,4'}).addTo(map);
+  }
+
+  function finishDrawRoute() {
+    if (!isDrawing && tempDrawPoints.length < 2) return;
+    isDrawing = false;
+    map.off('click', onMapClickForDraw);
+    map.doubleClickZoom.enable();
+    document.getElementById("finishDrawBtn").disabled = true;
+
+    if (tempDrawPoints.length < 2) {
+      alert("Need at least two points.");
+      return;
+    }
+
+    // convert to lineString (lon,lat order)
+    const coords = tempDrawPoints.map(p => [p[1], p[0]]);
+    const ls = {type:'Feature', geometry:{type:'LineString', coordinates: coords}};
+    setCurrentRoute(ls);
+    addCommuteToList({name: `Drawn ${new Date().toLocaleTimeString()}`, geojson: ls});
+
+    // clear temp
+    tempDrawPoints = [];
+    if (drawPolyline) { map.removeLayer(drawPolyline); drawPolyline = null; }
+  }
+
+  // add commute to the dropdown/list (simple in-memory store)
+  const savedCommutes = [];
+  function addCommuteToList(commute) {
+    savedCommutes.push(commute);
+    renderCommuteList();
+  }
+  function renderCommuteList() {
+    const container = document.getElementById("commuteList");
+    container.innerHTML = "<strong>Saved commutes (session):</strong>";
+    savedCommutes.forEach((c, i) => {
+      const div = document.createElement('div');
+      div.className = 'commute-item';
+      div.innerHTML = `<input type="radio" name="commuteSelect" id="commute${i}" ${i===savedCommutes.length-1?'checked':''}/>
+                       <label for="commute${i}"> ${c.name}</label>
+                       <button onclick="loadCommute(${i})">Load</button>
+                       <button onclick="removeCommute(${i})">Delete</button>`;
+      container.appendChild(div);
+    });
+  }
+  function loadCommute(i) {
+    setCurrentRoute(savedCommutes[i].geojson);
+  }
+  function removeCommute(i) {
+    savedCommutes.splice(i,1);
+    renderCommuteList();
+    clearCommute();
+  }
+
+  // ---- core: find intersections within buffer and order them ----
+  function findIntersectionsOnRoute(bufferMeters=null) {
+    if (!currentRouteGeoJSON) { alert("No route set."); return []; }
+    bufferMeters = bufferMeters || +document.getElementById("bufferInput").value;
+    const line = currentRouteGeoJSON;
+    const lineForTurf = turf.lineString(line.geometry.coordinates);
+
+    // For performance, we'll compute point-to-line distance in meters, and if <= buffer, include.
+    const results = [];
+    for (const d of allData) {
+      const pt = turf.point([d.lon, d.lat]);
+      const dist = turf.pointToLineDistance(pt, lineForTurf, {units:'meters'});
+      if (dist <= bufferMeters) {
+        // snapped nearest point (gives properties including dist)
+        const snapped = turf.nearestPointOnLine(lineForTurf, pt, {units:'meters'});
+        // get along-route distance: measure from line start to snapped point by slicing from start to snapped
+        const startPt = turf.point(lineForTurf.geometry.coordinates[0]);
+        const slice = turf.lineSlice(startPt, snapped, lineForTurf);
+        const along_km = turf.length(slice, {units:'kilometers'}); // in km
+        const along_m = along_km * 1000;
+        results.push({
+          data: d,
+          distanceToRoute_m: dist,
+          snapped,
+          along_m
+        });
+      }
+    }
+
+    // sort by along-route position (ascending)
+    results.sort((a,b) => a.along_m - b.along_m);
+    return results;
+  }
+
+  function showAllOnCommute() {
+    const matches = findIntersectionsOnRoute();
+    renderCommuteMatches(matches.slice());
+  }
+
+  function showTopNOnCommute() {
+    const n = +document.getElementById("topNInput").value;
+    const matches = findIntersectionsOnRoute();
+    // sort by danger descending and pick top n, but we also want to preserve along-route ordering in display
+    const sortedByDanger = matches.slice().sort((a,b) => b.data.danger - a.data.danger);
+    const top = sortedByDanger.slice(0, n);
+    // optionally reorder them by along_m for display
+    top.sort((a,b) => a.along_m - b.along_m);
+    renderCommuteMatches(top);
+  }
+
+  function renderCommuteMatches(matches) {
+    commuteHighlightLayer.clearLayers();
+    // highlight route buffer and route remain
+    drawBufferForRoute();
+
+    // create list HTML
+    const container = document.getElementById("commuteResults");
+    if (matches.length === 0) {
+      container.innerHTML = "<em>No intersections found on the current commute (increase buffer if needed).</em>";
+      return;
+    }
+
+    // display summary and add markers
+    matches.forEach((m, idx) => {
+      const d = m.data;
+      
+      // add highlight marker
+      const mark = L.circleMarker([d.lat, d.lon], {
+        radius: 8,
+        color: "#000",
+        weight: 1,
+        fillColor: d.valueColor,
+        fillOpacity: 1
+      }).bindPopup(`<strong>Ward ${d.ward}<br>Total collisions: ${d.collisions}`);
+      mark.addTo(commuteHighlightLayer);
+      // store index on marker for zooming reference
+      mark._commuteIndex = idx;
+    });
+    html += `</ol>`;
+    container.innerHTML = html;
+
+    // attach zoom handlers via map layer ordering (we rely on commuteHighlightLayer order)
+    // We'll also keep the matches in a global var so zoomToMatch can access
+    window._lastCommuteMatches = matches;
+  }
+
+  function zoomToMatch(idx) {
+    const matches = window._lastCommuteMatches || [];
+    if (!matches[idx]) return;
+    const lat = matches[idx].data.lat;
+    const lon = matches[idx].data.lon;
+    map.setView([lat, lon], 17);
+    // open popup by finding marker (iterate commuteHighlightLayer)
+    commuteHighlightLayer.eachLayer(layer => {
+      if (layer.getLatLng && Math.abs(layer.getLatLng().lat - lat) < 1e-6) {
+        layer.openPopup();
+      }
+    });
+  }
+
+  // helper for removing drawn route when user explicitly clears
+  function removeAllCommutes() {
+    savedCommutes.length = 0;
+    renderCommuteList();
+    clearCommute();
+  }
+
+  // attach simple double-click to finish drawing
+  map.on('dblclick', function(e){
+    if (isDrawing) finishDrawRoute();
+  });
+
+  // expose some functions to window for button handlers inside generated HTML
+  window.loadCommute = loadCommute;
+  window.removeCommute = removeCommute;
+  window.zoomToMatch = zoomToMatch;
+
+</script>
+
+</body>
+</html>
